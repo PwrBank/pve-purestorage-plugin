@@ -51,6 +51,7 @@ my $PSFA_API               = '2.26';
 my $purestorage_wwn_prefix = '3624a9370';
 my $default_hgsuffix       = "";
 my $default_protocol       = 'iscsi';
+my $cached_host_nqn        = undef;
 
 # Global debug level (can be overridden per-storage or via environment)
 my $DEBUG = $ENV{ PURESTORAGE_DEBUG } // 0;
@@ -189,6 +190,11 @@ sub properties {
       type        => 'string',
       default     => $default_protocol
     },
+    nvme_portal => {
+      description => "NVMe-TCP portal address(es), comma-separated (host or host:port). "
+                   . "If omitted, portals are discovered from the array API.",
+      type        => 'string'
+    },
     token_ttl => {
       description => "Session token time-to-live in seconds.",
       type        => 'integer',
@@ -214,8 +220,9 @@ sub options {
     podname   => { optional => 1 },
     vnprefix  => { optional => 1 },
     check_ssl => { optional => 1 },
-    protocol  => { optional => 1 },
-    token_ttl => { optional => 1 },
+    protocol    => { optional => 1 },
+    nvme_portal => { optional => 1 },
+    token_ttl   => { optional => 1 },
     debug     => { optional => 1 },
     nodes     => { optional => 1 },
     disable   => { optional => 1 },
@@ -235,7 +242,8 @@ my $cmd = {
   dmsetup    => '/sbin/dmsetup',
   kpartx     => '/sbin/kpartx',
   udevadm    => '/usr/bin/udevadm',
-  sync       => '/usr/bin/sync'
+  sync       => '/usr/bin/sync',
+  nvme       => '/usr/sbin/nvme'
 };
 
 # Get full path for a command, checking availability
@@ -262,6 +270,7 @@ sub check_commands {
   my @missing;
 
   foreach my $name ( keys %$cmd ) {
+    next if $name eq 'nvme';   # Optional: only required when protocol = nvme
     my $path = $cmd->{ $name };
     if ( !-x $path ) {
       push @missing, "$name ($path)";
@@ -499,6 +508,18 @@ sub get_device_path_wwn {
   return ( $path, $wwn );
 }
 
+sub get_device_path_nvme {
+  my ( $serial ) = @_;
+
+  $fatal->( "Volume serial is missing", undef ) unless length( $serial );
+
+  # VERIFY: Pure Storage EUI-64 = OUI (24a937) + 00 + last 8 hex chars of serial
+  # Confirm against: nvme list && ls /dev/disk/by-id/nvme-eui* on live array
+  my $eui  = '24a93700' . lc( substr( $serial, -8 ) );
+  my $path = '/dev/disk/by-id/nvme-eui.' . $eui;
+  return ( $path, $eui );
+}
+
 sub get_device_size {
   my ( $device ) = @_;
   $logger->( P_DEBUG, "get_device_size($device)", undef );
@@ -508,6 +529,68 @@ sub get_device_size {
 
   $logger->( P_DEBUG, "Device \"$device\" size is $size bytes", undef );
   return $size;
+}
+
+sub get_host_nqn {
+  return $cached_host_nqn if defined $cached_host_nqn;
+
+  my $nqn = file_read_firstline( '/etc/nvme/hostnqn' );
+  $nqn = '' unless defined $nqn;
+  $nqn =~ s/^\s+|\s+$//g;    # Trim whitespace
+
+  if ( !length( $nqn ) || $nqn !~ m/^nqn\.\d{4}-\d{2}\.[a-zA-Z0-9\-\.]+:[^\s]+$/ ) {
+    die "NVMe host NQN not found. Ensure nvme-cli is installed and /etc/nvme/hostnqn exists.\n";
+  }
+
+  $cached_host_nqn = $nqn;
+  return $cached_host_nqn;
+}
+
+sub nvme_get_target_ips {
+  my ( $scfg, $storeid ) = @_;
+
+  my @targets;
+
+  # Path 1: Use nvme_portal if provided
+  if ( defined $scfg->{ nvme_portal } && $scfg->{ nvme_portal } ne '' ) {
+    my $portal = $scfg->{ nvme_portal };
+
+    # Split by comma for multiple portals
+    foreach my $addr ( split( ',', $portal ) ) {
+      $addr =~ s/^\s+|\s+$//g;    # Trim whitespace
+
+      my $port = 4420;             # NVMe-TCP default
+      if ( $addr =~ s/:(\d+)$// ) { $port = $1; }
+
+      push @targets, { ip => $addr, port => $port } if length( $addr );
+    }
+  } else {
+
+    # Path 2: Call API to discover NVMe-TCP interfaces
+    my $action = {
+      name   => 'get nvme-tcp interfaces',
+      type   => 'network-interfaces',
+      method => 'GET',
+      params => { filter => "services='nvme-tcp'" }
+    };
+
+    my $response = purestorage_api_call( $scfg, $action, 0, $storeid );
+
+    foreach my $iface ( @{ $response->{ items } || [] } ) {
+      my $addr = $iface->{ address };
+      next unless defined $addr && length( $addr );
+
+      # Strip CIDR suffix (e.g., "192.168.1.1/24" -> "192.168.1.1")
+      $addr =~ s|/\d+$||;
+
+      push @targets, { ip => $addr, port => 4420 };
+    }
+  }
+
+  # If no targets found, die with exact message
+  die "No NVMe-TCP interfaces found on array. Verify NVMe-TCP is configured.\n" if !@targets;
+
+  return @targets;
 }
 
 sub device_op {
@@ -1442,23 +1525,57 @@ sub purestorage_resize_volume {
 
   my $serial = $response->{ items }->[0]->{ serial } or $fatal->( "Failed to retrieve volume serial", $scfg );
 
-  my ( $path, $wwid ) = get_device_path_wwn( $serial );
+  my $protocol = $scfg->{ protocol } // $default_protocol;
+  my ( $path, $wwid );
 
-  # return early if the volume is not mapped (normally should not happen)
-  return $size unless $path ne '' && -b $path;
+  my $device_path;
 
-  my ( $device_path, @slaves ) = block_device_slaves( $path );
+  if ( $protocol eq 'nvme' ) {
+    # For NVMe: get device path from serial, trigger namespace rescan
+    ( $path, $wwid ) = get_device_path_nvme( $serial );
 
-  # Iterate through slaves and rescan each device
-  block_device_action( 'rescan', @slaves );
+    # return early if the volume is not mapped (normally should not happen)
+    return $size unless $path ne '' && -b $path;
 
-  if ( multipath_check( $wwid ) ) {
-    $logger->( P_DEBUG, "Device \"$wwid\" is a multipath device. Proceeding with resizing.", $scfg );
-    exec_command( [ 'multipathd', 'resize', 'map', $wwid ] );
+    $device_path = $path;
+
+    # Extract NVMe controller and namespace from path (e.g., /dev/nvme0n1 -> nvme0)
+    my $dev_name = basename( $path );
+    if ( $dev_name =~ /^(nvme\d+)n\d+$/ ) {
+      my $nvme_controller = $1;
+      my $controller_path = "/dev/$nvme_controller";
+
+      # Trigger NVMe namespace rescan on the controller using nvme-cli
+      $logger->( P_DEBUG, "Rescanning NVMe namespaces on $controller_path", $scfg );
+      eval { exec_command( [ $cmd->{ nvme }, 'ns-rescan', $controller_path ] ); };
+      if ( $@ ) {
+        $logger->( P_WARN, "NVMe namespace rescan failed: $@. Continuing with size verification.", $scfg );
+      }
+    } else {
+      $logger->( P_WARN, "Unable to extract NVMe controller from $path", $scfg );
+    }
+
+  } else {
+    # For iSCSI/FC: use existing SCSI rescan path
+    ( $path, $wwid ) = get_device_path_wwn( $serial );
+
+    # return early if the volume is not mapped (normally should not happen)
+    return $size unless $path ne '' && -b $path;
+
+    my @slaves;
+    ( $device_path, @slaves ) = block_device_slaves( $path );
+
+    # Iterate through slaves and rescan each device
+    block_device_action( 'rescan', @slaves );
+
+    if ( multipath_check( $wwid ) ) {
+      $logger->( P_DEBUG, "Device \"$wwid\" is a multipath device. Proceeding with resizing.", $scfg );
+      exec_command( [ 'multipathd', 'resize', 'map', $wwid ] );
+    }
   }
 
+  # Shared polling block
   $logger->( P_DEBUG, "Expected size = $size", $scfg );
-
   my $new_size;
   my $updated_size = sub {
     $new_size = get_device_size( $device_path );
@@ -1467,11 +1584,8 @@ sub purestorage_resize_volume {
 
   # FIXME: With the current implementation we may not need to wait
   wait_for( $updated_size, "volume \"$volname\" size update" );
-
   $logger->( P_DEBUG, "New size detected for volume \"$volname\": $new_size bytes.", $scfg );
-
-  $logger->( P_INFO, "Volume \"$volname\" is resized.", $scfg );
-
+  $logger->( P_INFO,  "Volume \"$volname\" is resized.", $scfg );
   return $new_size;
 }
 
@@ -1608,7 +1722,22 @@ sub filesystem_path {
   # do we even need this?
   my ( $vtype, undef, $vmid ) = $class->parse_volname( $volname );
 
-  my ( $path, $wwid ) = $class->purestorage_get_wwn( $scfg, $volname );
+  my ( $path, $wwid );
+  my $protocol = $scfg->{ protocol } // $default_protocol;
+
+  if ( $protocol eq 'nvme' ) {
+    # For NVMe: get volume serial and construct EUI-64 based device path
+    my $volume = $class->purestorage_get_existing_volume_info( $scfg, $volname );
+    if ( $volume ) {
+      ( $path, $wwid ) = get_device_path_nvme( $volume->{ serial } );
+    } else {
+      $logger->( P_WARN, "Can't get volume \"$volname\" info for NVMe path", $scfg );
+      ( $path, $wwid ) = ( '', '' );
+    }
+  } else {
+    # For iSCSI/FC: use existing SCSI WWN-based device path
+    ( $path, $wwid ) = $class->purestorage_get_wwn( $scfg, $volname );
+  }
 
   if ( !defined( $path ) || !defined( $vmid ) || !defined( $vtype ) ) {
     return wantarray ? ( "", "", "", "" ) : "";
@@ -1755,6 +1884,36 @@ sub activate_storage {
   set_debug_from_config( $scfg );
   $logger->( P_DEBUG, "activate_storage ($storeid)", $scfg );
 
+  my $protocol = $scfg->{ protocol } // $default_protocol;
+
+  # ActiveCluster guard: NVMe-TCP does not support multiple array addresses
+  if ( $protocol eq 'nvme' ) {
+    my @urls = split( ',', $scfg->{ address } // '' );
+    if ( scalar( @urls ) > 1 ) {
+      $fatal->( "NVMe-TCP protocol does not support ActiveCluster (multiple array addresses). "
+              . "Use a single array address or switch to iSCSI/FC.", $scfg );
+    }
+
+    # Check nvme-cli binary exists
+    $fatal->( "nvme-cli not found. Install nvme-cli package.\n", $scfg ) unless -x $cmd->{ nvme };
+
+    # Check nvme_tcp kernel module is loaded
+    $fatal->( "nvme-tcp kernel module not loaded. Run: modprobe nvme-tcp\n", $scfg ) unless -d '/sys/module/nvme_tcp';
+
+    # Check nvme_core.multipath (warn, don't die - single path still works)
+    if ( -f '/sys/module/nvme_core/parameters/multipath' ) {
+      my $multipath_enabled = file_read_firstline( '/sys/module/nvme_core/parameters/multipath' );
+      if ( !defined $multipath_enabled || $multipath_enabled !~ m/^Y/i ) {
+        $logger->( P_WARN, "Native NVMe multipath not enabled. Enable with: echo 'options nvme_core multipath=Y' > /etc/modprobe.d/nvme.conf", $scfg );
+      }
+    } else {
+      $logger->( P_WARN, "Could not verify NVMe multipath status. Ensure kernel module nvme_core is loaded.", $scfg );
+    }
+
+    # Validate hostnqn exists and is valid
+    get_host_nqn();
+  }
+
   return 1;
 }
 
@@ -1782,38 +1941,70 @@ sub volume_size_info {
 sub map_volume {
   my ( $class, $storeid, $scfg, $volname, $snapname, $hints ) = @_;
   $logger->( P_DEBUG, "map_volume", $scfg );
-  my ( $path, $wwid ) = $class->purestorage_get_wwn( $scfg, $volname );
-
-  $logger->( P_DEBUG, "Mapping volume \"$volname\" with WWN: " . uc( $wwid ) . ".", $scfg );
 
   my $protocol = $scfg->{ protocol } // $default_protocol;
+  my ( $path, $wwid );
+
   if ( $protocol eq 'iscsi' || $protocol eq 'fc' ) {
+    ( $path, $wwid ) = $class->purestorage_get_wwn( $scfg, $volname );
+    $logger->( P_DEBUG, "Mapping volume \"$volname\" with WWN: " . uc( $wwid ) . ".", $scfg );
     scsi_scan_new( $protocol, $scfg );
+
   } elsif ( $protocol eq 'nvme' ) {
-    $fatal->( "Protocol: \"$protocol\" isn't implemented yet", $scfg );
+    my $volume = $class->purestorage_get_existing_volume_info( $scfg, $volname );
+    $fatal->( "Cannot get volume info for NVMe map: $volname", $scfg ) unless $volume;
+    ( $path, $wwid ) = get_device_path_nvme( $volume->{ serial } );
+
+    $logger->( P_DEBUG, "Connecting NVMe-TCP for volume \"$volname\" (EUI: $wwid)", $scfg );
+
+    my $hostnqn   = get_host_nqn();
+    my @targets   = nvme_get_target_ips( $scfg, $storeid );
+    my $connected = 0;
+
+    foreach my $target ( @targets ) {
+      my ( $ip, $port ) = @{$target}{qw( ip port )};
+      $logger->( P_DEBUG, "Connecting NVMe-TCP to $ip:$port", $scfg );
+
+      my $ok = exec_command(
+        [ $cmd->{ nvme }, 'connect-all', '--transport=tcp',
+          "--traddr=$ip", "--trsvcid=$port", "--hostnqn=$hostnqn" ],
+        -1    # silent: log manually, don't fatal
+      );
+
+      if ( $ok ) {
+        $logger->( P_DEBUG, "NVMe-TCP connected to $ip:$port", $scfg );
+        $connected++;
+      } else {
+        $logger->( P_WARN, "NVMe-TCP connect to $ip:$port failed", $scfg );
+      }
+    }
+
+    $fatal->( "NVMe-TCP: failed to connect to any target. "
+            . "Check nvme_portal config or array NVMe-TCP interface settings.", $scfg )
+      unless $connected;
+
   } else {
     $fatal->( "Protocol: \"$protocol\" isn't a valid protocol", $scfg );
   }
 
-  my $path_exists = sub {
-    return -e $path;
-  };
-
-  # Wait for the device to appear
+  my $path_exists = sub { return -e $path; };
   wait_for( $path_exists, "volume \"$volname\" to map", 30 );
 
-  # we might end up with operational disk but without multipathing, e.g.
-  # if unmapping was interrupted ('remove map' was already done, but slaves were not removed)
-  if ( !multipath_check( $wwid ) ) {
-    $logger->( P_DEBUG, "Adding multipath map for device \"$wwid\"", $scfg );
-    exec_command( [ 'multipathd', 'add', 'map', $wwid ] );
+  # Multipath handling — SCSI only (NVMe uses native kernel multipath transparently)
+  if ( $protocol ne 'nvme' ) {
 
-    # Wait for multipath to be fully established
-    my $multipath_ready = sub {
-      return multipath_check( $wwid );
-    };
-    wait_for( $multipath_ready, "multipath map for volume \"$volname\" to be ready", 30 );
+    # we might end up with operational disk but without multipathing, e.g.
+    # if unmapping was interrupted ('remove map' was already done, but slaves were not removed)
+    if ( !multipath_check( $wwid ) ) {
+      $logger->( P_DEBUG, "Adding multipath map for device \"$wwid\"", $scfg );
+      exec_command( [ 'multipathd', 'add', 'map', $wwid ] );
+
+      # Wait for multipath to be fully established
+      my $multipath_ready = sub { return multipath_check( $wwid ); };
+      wait_for( $multipath_ready, "multipath map for volume \"$volname\" to be ready", 30 );
+    }
   }
+
   return $path;
 }
 
@@ -1821,36 +2012,64 @@ sub unmap_volume {
   my ( $class, $storeid, $scfg, $volname, $snapname ) = @_;
   $logger->( P_DEBUG, "unmap_volume", $scfg );
 
-  my ( $path, $wwid ) = $class->purestorage_get_wwn( $scfg, $volname );
-  return 0 unless $path ne '' && -b $path;
+  my $protocol = $scfg->{ protocol } // $default_protocol;
 
-  my ( $device_path, @slaves ) = block_device_slaves( $path );
+  if ( $protocol eq 'nvme' ) {
+    my $volume = $class->purestorage_get_existing_volume_info( $scfg, $volname );
+    unless ( $volume ) {
+      $logger->( P_WARN, "Cannot get volume info for NVMe unmap: $volname", $scfg );
+      return 0;
+    }
 
-  # Ensure all data is flushed to disk for write-back cache environments
-  $logger->( P_VERB, "Flushing filesystem and device buffers for $device_path", $scfg );
-  exec_command( ['sync'] );
-  exec_command( [ 'blockdev', '--flushbufs', $device_path ] );
+    my ( $path, $eui ) = get_device_path_nvme( $volume->{ serial } );
+    return 0 unless $path ne '' && -b $path;
 
-  # Wait for udev events to settle, ensuring all async operations complete
-  eval { exec_command( [ 'udevadm', 'settle', '--timeout=10' ] ) };
+    my $device_path = abs_path( $path ) // $path;
+    $logger->( P_VERB, "Flushing NVMe device $device_path before unmap", $scfg );
+    exec_command( ['sync'] );
+    eval { exec_command( [ 'blockdev', '--flushbufs', $device_path ] ) };
+    eval { exec_command( [ 'udevadm', 'settle', '--timeout=10' ] ) };
+    exec_command( ['sync'] );
 
-  # Final sync to guarantee write-back cache is flushed
-  exec_command( ['sync'] );
+    # NVMe-TCP: no kernel-level disconnect here.
+    # purestorage_volume_connection(mode=0) will remove the volume connection on
+    # the array; the namespace will disappear naturally from the kernel's view.
+    $logger->( P_DEBUG, "NVMe device $device_path flushed. "
+             . "Array will remove namespace after volume connection is deleted.", $scfg );
+    return 1;
 
-  if ( multipath_check( $wwid ) ) {
-    $logger->( P_DEBUG, "Device \"$wwid\" is a multipath device. Proceeding with multipath removal.", $scfg );
-
-    # remove the link
-    exec_command( [ 'multipathd', 'remove', 'map', $wwid ] );
   } else {
-    $logger->( P_DEBUG, "Device \"$wwid\" is not a multipath device. Skipping multipath removal.", $scfg );
+    my ( $path, $wwid ) = $class->purestorage_get_wwn( $scfg, $volname );
+    return 0 unless $path ne '' && -b $path;
+
+    my ( $device_path, @slaves ) = block_device_slaves( $path );
+
+    # Ensure all data is flushed to disk for write-back cache environments
+    $logger->( P_VERB, "Flushing filesystem and device buffers for $device_path", $scfg );
+    exec_command( ['sync'] );
+    exec_command( [ 'blockdev', '--flushbufs', $device_path ] );
+
+    # Wait for udev events to settle, ensuring all async operations complete
+    eval { exec_command( [ 'udevadm', 'settle', '--timeout=10' ] ) };
+
+    # Final sync to guarantee write-back cache is flushed
+    exec_command( ['sync'] );
+
+    if ( multipath_check( $wwid ) ) {
+      $logger->( P_DEBUG, "Device \"$wwid\" is a multipath device. Proceeding with multipath removal.", $scfg );
+
+      # remove the link
+      exec_command( [ 'multipathd', 'remove', 'map', $wwid ] );
+    } else {
+      $logger->( P_DEBUG, "Device \"$wwid\" is not a multipath device. Skipping multipath removal.", $scfg );
+    }
+
+    # Iterate through slaves and remove each device
+    block_device_action( 'remove', @slaves );
+
+    $logger->( P_DEBUG, "Device \"$wwid\" is removed.", $scfg );
+    return 1;
   }
-
-  # Iterate through slaves and remove each device
-  block_device_action( 'remove', @slaves );
-
-  $logger->( P_DEBUG, "Device \"$wwid\" is removed.", $scfg );
-  return 1;
 }
 
 sub activate_volume {
